@@ -26,7 +26,7 @@ dockerhub_user = "youkim7"
 
 # Image Tags
 fe_image_tag  = "dev-009"
-api_image_tag = "dev-004"
+api_image_tag = "yousef-final"
 
 # Tags
 tags = {

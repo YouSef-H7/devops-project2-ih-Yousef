@@ -83,14 +83,14 @@ resource "azurerm_application_gateway" "main" {
     timeout                                   = 30
     unhealthy_threshold                       = 3
     pick_host_name_from_backend_http_settings = true
-    port                                      = 8080
+    port                                      = 80
     
     match {
       status_code = ["200-299"]
     }
   }
 
-  # HTTP settings - use HTTP to backend with proper ports
+  # HTTP settings - use HTTP to backend Container Apps (HTTPS termination at App Gateway)
   backend_http_settings {
     name                                = "frontend-http-settings"
     cookie_based_affinity               = "Disabled"
@@ -108,7 +108,7 @@ resource "azurerm_application_gateway" "main" {
     name                                = "backend-http-settings"
     cookie_based_affinity               = "Disabled"
     path                                = "/"
-    port                                = 8080
+    port                                = 80
     protocol                            = "Http"
     request_timeout                     = 60
     pick_host_name_from_backend_address = true

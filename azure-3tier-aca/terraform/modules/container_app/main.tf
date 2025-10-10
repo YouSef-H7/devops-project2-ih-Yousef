@@ -37,7 +37,7 @@ resource "azurerm_container_app" "main" {
   dynamic "ingress" {
     for_each = var.ingress_enabled ? [1] : []
     content {
-      allow_insecure_connections = false  # Force HTTPS
+      allow_insecure_connections = true   # Allow HTTP for internal Application Gateway communication
       external_enabled           = true   # Temporarily external to bypass environment limit
       target_port                = var.container_port
       transport                  = "auto"
