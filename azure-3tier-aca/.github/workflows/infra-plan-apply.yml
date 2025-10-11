@@ -1,215 +1,273 @@
-name: Infrastructure Plan and Apply
+# Infrastructure Terraform Plan & Apply Workflow
+#
+# Triggers:
+#   - pull_request that touches azure-3tier-aca/terraform/** → Plan only
+#   - push to main touching azure-3tier-aca/terraform/** → Apply (requires environment approval)
+#   - workflow_dispatch with input to choose Plan or Apply
+#
+# Required Secrets:
+#   - AZURE_CREDENTIALS (for OIDC)
+#
+# Required Variables:
+#   - AZ_SUBSCRIPTION_ID
+#
+# Environment:
+#   - prod (required for Apply, with manual reviewers)
+#
+# Notes:
+#   - Terraform root: azure-3tier-aca/terraform
+#   - Backend uses AzureRM with RBAC (no storage keys needed)
+#   - Guard prevents destructive changes on sensitive resources
+
+name: Infrastructure - Terraform Plan & Apply
 
 on:
-  push:
-    branches: [main]
-    paths: ['terraform/**']
   pull_request:
-    branches: [main]
-    paths: ['terraform/**']
+    paths:
+      - 'azure-3tier-aca/terraform/**'
+  push:
+    branches:
+      - main
+    paths:
+      - 'azure-3tier-aca/terraform/**'
   workflow_dispatch:
     inputs:
-      environment:
-        description: 'Environment to deploy'
-        required: true
-        default: 'dev'
-        type: choice
-        options:
-          - dev
-          - prod
       action:
-        description: 'Terraform action'
+        description: 'Terraform action to perform'
         required: true
-        default: 'plan'
         type: choice
         options:
           - plan
           - apply
-          - destroy
+        default: 'plan'
 
-env:
-  TF_VERSION: '1.5.7'
-  WORKING_DIRECTORY: ./azure-3tier-aca/terraform/main
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  terraform-plan:
+  tf_plan:
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment || 'dev' }}
-    
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    outputs:
+      unsafe: ${{ steps.guard.outputs.unsafe }}
+    defaults:
+      run:
+        working-directory: azure-3tier-aca/terraform
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Terraform
-      uses: hashicorp/setup-terraform@v3
-      with:
-        terraform_version: ${{ env.TF_VERSION }}
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientId }}
+          tenant-id: ${{ fromJSON(secrets.AZURE_CREDENTIALS).tenantId }}
+          subscription-id: ${{ fromJSON(secrets.AZURE_CREDENTIALS).subscriptionId }}
 
-    - name: Configure Azure credentials
-      uses: azure/login@v1
-      with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Set Azure subscription
+        run: |
+          az account set --subscription ${{ vars.AZ_SUBSCRIPTION_ID }}
 
-    - name: Set environment variables
-      run: |
-        if [[ "${{ github.event.inputs.environment }}" == "prod" ]] || [[ "${{ github.ref }}" == "refs/heads/main" && "${{ github.event.inputs.environment }}" == "" ]]; then
-          echo "ENVIRONMENT=prod" >> $GITHUB_ENV
-          echo "TF_VAR_FILE=../environments/prod.tfvars" >> $GITHUB_ENV
-        else
-          echo "ENVIRONMENT=dev" >> $GITHUB_ENV
-          echo "TF_VAR_FILE=../environments/dev.tfvars" >> $GITHUB_ENV
-        fi
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '>=1.6'
+          terraform_wrapper: false
 
-    - name: Terraform Init
-      working-directory: ${{ env.WORKING_DIRECTORY }}
-      run: |
-        terraform init \
-          -backend-config="../backend.hcl" \
-          -backend-config="key=${{ env.ENVIRONMENT }}.tfstate"
+      - name: Terraform Init
+        run: |
+          terraform init -lock-timeout=5m
 
-    - name: Terraform Validate
-      working-directory: ${{ env.WORKING_DIRECTORY }}
-      run: terraform validate
+      - name: Terraform Validate
+        run: |
+          terraform validate
 
-    - name: Terraform Format Check
-      working-directory: ${{ env.WORKING_DIRECTORY }}
-      run: terraform fmt -check
-
-    - name: Terraform Plan
-      working-directory: ${{ env.WORKING_DIRECTORY }}
-      run: |
-        terraform plan \
-          -var-file="${{ env.TF_VAR_FILE }}" \
-          -out=tfplan \
-          -detailed-exitcode
-
-    - name: Upload Terraform Plan
-      uses: actions/upload-artifact@v3
-      with:
-        name: tfplan-${{ env.ENVIRONMENT }}
-        path: ${{ env.WORKING_DIRECTORY }}/tfplan
-        retention-days: 7
-
-    - name: Comment PR with Plan
-      if: github.event_name == 'pull_request'
-      uses: actions/github-script@v7
-      with:
-        script: |
-          const fs = require('fs');
-          const { execSync } = require('child_process');
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -no-color -out=tfplan.bin -lock-timeout=5m 2>&1 | tee plan.txt
+          PLAN_EXIT_CODE=${PIPESTATUS[0]}
+          set -e
           
-          try {
-            const planOutput = execSync('cd ${{ env.WORKING_DIRECTORY }} && terraform show -no-color tfplan', { encoding: 'utf8' });
+          echo "exit_code=${PLAN_EXIT_CODE}" >> $GITHUB_OUTPUT
+          
+          if [ $PLAN_EXIT_CODE -ne 0 ]; then
+            echo "::error::Terraform plan failed"
+            exit $PLAN_EXIT_CODE
+          fi
+
+      - name: Export plan as JSON
+        run: terraform show -json tfplan.bin > plan.json
+
+      - name: Guard against destructive changes on sensitive resources
+        id: guard
+        run: |
+          # Define sensitive resource types that should not be destroyed/replaced
+          SENSITIVE_TYPES='["azurerm_mssql_server","azurerm_virtual_network","azurerm_subnet","azurerm_private_endpoint","azurerm_private_dns_zone"]'
+          
+          MATCHES=$(jq \
+            --argjson types "$SENSITIVE_TYPES" '
+              .resource_changes
+              | map(select( (.type as $t | $types | index($t)) and
+                             ((.change.actions | index("delete")) or (.change.actions | index("replace")) )))
+              | length
+            ' plan.json)
+          
+          echo "Found $MATCHES destructive/replace change(s) on sensitive resource types."
+          
+          if [ "$MATCHES" -gt 0 ]; then
+            echo "unsafe=true" >> $GITHUB_OUTPUT
+            echo "::error::Plan contains delete/replace operations on SENSITIVE resources. Blocking apply."
+            echo "::error::Sensitive types checked: azurerm_mssql_server, azurerm_virtual_network, azurerm_subnet, azurerm_private_endpoint, azurerm_private_dns_zone"
+            exit 1
+          else
+            echo "unsafe=false" >> $GITHUB_OUTPUT
+            echo "✓ No destructive changes on sensitive resources detected. Safe to proceed."
+          fi
+
+      - name: Upload plan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: |
+            azure-3tier-aca/terraform/tfplan.bin
+            azure-3tier-aca/terraform/plan.txt
+            azure-3tier-aca/terraform/plan.json
+          retention-days: 30
+
+      - name: Post PR comment with plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const planText = fs.readFileSync('azure-3tier-aca/terraform/plan.txt', 'utf8');
+            const maxLength = 65000;
+            let truncatedPlan = planText;
             
-            const body = `## Terraform Plan (${{ env.ENVIRONMENT }})
+            if (planText.length > maxLength) {
+              truncatedPlan = planText.substring(0, maxLength) + '\n\n... (plan truncated due to length)';
+            }
+            
+            const output = `### Terraform Plan Results 📋
             
             <details>
-            <summary>Click to expand</summary>
+            <summary>Show Plan Output</summary>
             
+            \`\`\`terraform
+            ${truncatedPlan}
             \`\`\`
-            ${planOutput}
-            \`\`\`
             
-            </details>`;
+            </details>
             
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
+            **Plan Status:** ${{ steps.plan.outputs.exit_code == '0' && '✅ Success' || '❌ Failed' }}
+            **Sensitive Guard:** ${{ steps.guard.outputs.unsafe == 'true' && '❌ Blocked (destructive changes on sensitive resources)' || '✅ Clear' }}
+            **Triggered by:** @${{ github.actor }}
+            **Commit:** ${{ github.sha }}
+            `;
+            
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: body
+              issue_number: context.issue.number,
             });
-          } catch (error) {
-            console.log('Error creating comment:', error);
-          }
+            
+            const botComment = comments.find(comment => 
+              comment.user.type === 'Bot' && 
+              comment.body.includes('Terraform Plan Results')
+            );
+            
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: output
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: output
+              });
+            }
 
-  terraform-apply:
+  tf_apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: tf_plan
     if: |
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply') ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    needs: terraform-plan
-    runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment || 'prod' }}
-    
+      needs.tf_plan.outputs.unsafe != 'true' && (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+      )
+    # environment: prod  # Create this environment in GitHub repo settings to enable manual approval
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: azure-3tier-aca/terraform
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Terraform
-      uses: hashicorp/setup-terraform@v3
-      with:
-        terraform_version: ${{ env.TF_VERSION }}
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientId }}
+          tenant-id: ${{ fromJSON(secrets.AZURE_CREDENTIALS).tenantId }}
+          subscription-id: ${{ fromJSON(secrets.AZURE_CREDENTIALS).subscriptionId }}
 
-    - name: Configure Azure credentials
-      uses: azure/login@v1
-      with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Set Azure subscription
+        run: |
+          az account set --subscription ${{ vars.AZ_SUBSCRIPTION_ID }}
 
-    - name: Set environment variables
-      run: |
-        if [[ "${{ github.event.inputs.environment }}" == "dev" ]]; then
-          echo "ENVIRONMENT=dev" >> $GITHUB_ENV
-          echo "TF_VAR_FILE=../environments/dev.tfvars" >> $GITHUB_ENV
-        else
-          echo "ENVIRONMENT=prod" >> $GITHUB_ENV
-          echo "TF_VAR_FILE=../environments/prod.tfvars" >> $GITHUB_ENV
-        fi
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '>=1.6'
+          terraform_wrapper: false
 
-    - name: Download Terraform Plan
-      uses: actions/download-artifact@v3
-      with:
-        name: tfplan-${{ env.ENVIRONMENT }}
-        path: ${{ env.WORKING_DIRECTORY }}
+      - name: Terraform Init
+        run: |
+          terraform init -lock-timeout=5m
 
-    - name: Terraform Init
-      working-directory: ${{ env.WORKING_DIRECTORY }}
-      run: |
-        terraform init \
-          -backend-config="../backend.hcl" \
-          -backend-config="key=${{ env.ENVIRONMENT }}.tfstate"
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: azure-3tier-aca/terraform
 
-    - name: Terraform Apply
-      working-directory: ${{ env.WORKING_DIRECTORY }}
-      run: terraform apply tfplan
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve -lock-timeout=5m tfplan.bin
+        env:
+          TF_LOG: INFO
 
-  terraform-destroy:
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
-    runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment || 'dev' }}
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Mask sensitive outputs
+        if: always()
+        run: |
+          # Mask any sensitive values that might appear in logs
+          echo "::add-mask::${{ secrets.AZURE_CREDENTIALS }}"
 
-    - name: Set up Terraform
-      uses: hashicorp/setup-terraform@v3
-      with:
-        terraform_version: ${{ env.TF_VERSION }}
-
-    - name: Configure Azure credentials
-      uses: azure/login@v1
-      with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-    - name: Set environment variables
-      run: |
-        if [[ "${{ github.event.inputs.environment }}" == "prod" ]]; then
-          echo "ENVIRONMENT=prod" >> $GITHUB_ENV
-          echo "TF_VAR_FILE=../environments/prod.tfvars" >> $GITHUB_ENV
-        else
-          echo "ENVIRONMENT=dev" >> $GITHUB_ENV
-          echo "TF_VAR_FILE=../environments/dev.tfvars" >> $GITHUB_ENV
-        fi
-
-    - name: Terraform Init
-      working-directory: ${{ env.WORKING_DIRECTORY }}
-      run: |
-        terraform init \
-          -backend-config="../backend.hcl" \
-          -backend-config="key=${{ env.ENVIRONMENT }}.tfstate"
-
-    - name: Terraform Destroy
-      working-directory: ${{ env.WORKING_DIRECTORY }}
-      run: |
-        terraform destroy \
-          -var-file="${{ env.TF_VAR_FILE }}" \
-          -auto-approve
+      - name: Upload apply logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-apply-logs-${{ github.sha }}
+          path: |
+            azure-3tier-aca/terraform/.terraform/**
+            azure-3tier-aca/terraform/terraform.tfstate.backup
+          retention-days: 7

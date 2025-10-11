@@ -12,7 +12,7 @@ on:
 env:
   REGISTRY_NAME: acrburgerbuilder
   IMAGE_NAME: backend
-  WORKING_DIRECTORY: ./azure-3tier-aca/backend
+  WORKING_DIRECTORY: ./backend
 
 jobs:
   test:

@@ -12,7 +12,7 @@ on:
 env:
   REGISTRY_NAME: acrburgerbuilder
   IMAGE_NAME: frontend
-  WORKING_DIRECTORY: ./azure-3tier-aca/frontend
+  WORKING_DIRECTORY: ./frontend
 
 jobs:
   build-and-push:
@@ -44,6 +44,9 @@ jobs:
     - name: Build application
       working-directory: ${{ env.WORKING_DIRECTORY }}
       run: npm run build
+      # لو عندك API URL وقت البناء (Vite مثلاً):
+      # env:
+      #   VITE_API_BASE_URL: ${{ secrets.FE_API_BASE_URL }}
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
