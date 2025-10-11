@@ -23,6 +23,11 @@ variable "aca_subnet_cidr" {
   type        = string
 }
 
+variable "aca_ca_subnet_cidr" {
+  description = "CIDR block for Container Apps Environment subnet (delegated to Microsoft.App/environments)"
+  type        = string
+}
+
 variable "pe_subnet_cidr" {
   description = "CIDR block for Private Endpoints subnet"
   type        = string

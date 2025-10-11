@@ -11,7 +11,14 @@ variable "resource_group_name" {
 variable "location" {
   description = "Azure region for resources"
   type        = string
-  default     = " uksouth"
+  default     = "uksouth"
+}
+
+# اختياري حالياً (نستخدم IP بدلاً من الدومين)
+variable "app_gateway_public_hostname" {
+  description = "Public hostname (FQDN) served by Application Gateway (e.g., api.yourdomain.com) — optional when using IP"
+  type        = string
+  default     = null
 }
 
 variable "environment" {
@@ -60,7 +67,13 @@ variable "agw_subnet_cidr" {
 }
 
 variable "aca_subnet_cidr" {
-  description = "CIDR block for Container Apps subnet"
+  description = "CIDR block for (old) Container Apps subnet"
+  type        = string
+}
+
+# ✅ جديد: سبنت بيئة الـ Container Apps المفوّضة
+variable "aca_ca_subnet_cidr" {
+  description = "CIDR block for Container Apps Environment subnet (delegated to Microsoft.App/environments)"
   type        = string
 }
 

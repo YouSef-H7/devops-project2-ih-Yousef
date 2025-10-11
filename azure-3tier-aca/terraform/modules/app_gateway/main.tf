@@ -8,7 +8,7 @@ resource "azurerm_public_ip" "agw" {
   tags                = var.tags
 }
 
-# Application Gateway with HTTPS termination and HTTP backend
+# Application Gateway on HTTP ONLY (for IP access, no domain/SSL)
 resource "azurerm_application_gateway" "main" {
   name                = var.name
   resource_group_name = var.resource_group_name
@@ -26,14 +26,10 @@ resource "azurerm_application_gateway" "main" {
     subnet_id = var.subnet_id
   }
 
+  # HTTP only
   frontend_port {
     name = "http-port"
     port = 80
-  }
-
-  frontend_port {
-    name = "https-port"
-    port = 443
   }
 
   frontend_ip_configuration {
@@ -41,25 +37,18 @@ resource "azurerm_application_gateway" "main" {
     public_ip_address_id = azurerm_public_ip.agw.id
   }
 
-  # SSL certificate for HTTPS termination - using Azure managed certificate
-  ssl_certificate {
-    name = "agw-ssl-cert"
-    data = filebase64("${path.module}/yousef-burgerbuilder.pfx")
-    password = "YousefBurgerBuilder2024!"
-  }
-
-  # Backend pools - use internal FQDNs
+  # Backend pools - internal FQDNs of Container Apps
   backend_address_pool {
-    name = "frontend-pool"
+    name  = "frontend-pool"
     fqdns = [var.frontend_fqdn]
   }
 
   backend_address_pool {
-    name = "backend-pool"
+    name  = "backend-pool"
     fqdns = [var.backend_fqdn]
   }
 
-  # Health probes - use HTTP to Container Apps internal endpoints
+  # Probes (HTTP)
   probe {
     name                                      = "frontend-probe"
     protocol                                  = "Http"
@@ -69,54 +58,44 @@ resource "azurerm_application_gateway" "main" {
     unhealthy_threshold                       = 5
     pick_host_name_from_backend_http_settings = true
     port                                      = 80
-    
-    match {
-      status_code = ["200-499"]
-    }
+    match { status_code = ["200-499"] }
   }
 
   probe {
-    name                                      = "backend-probe" 
+    name                                      = "backend-probe"
     protocol                                  = "Http"
-    path                                      = "/api/health"
+    path                                      = "/actuator/health"
     interval                                  = 30
     timeout                                   = 30
     unhealthy_threshold                       = 3
     pick_host_name_from_backend_http_settings = true
     port                                      = 80
-    
-    match {
-      status_code = ["200-299"]
-    }
+    match { status_code = ["200-299"] }
   }
 
-  # HTTP settings - use HTTP to backend Container Apps (HTTPS termination at App Gateway)
+  # HTTP settings to Container Apps (HTTP)
   backend_http_settings {
     name                                = "frontend-http-settings"
     cookie_based_affinity               = "Disabled"
-    path                                = "/"
     port                                = 80
     protocol                            = "Http"
     request_timeout                     = 60
     pick_host_name_from_backend_address = false
     host_name                           = var.frontend_fqdn
     probe_name                          = "frontend-probe"
-    trusted_root_certificate_names      = []
   }
 
   backend_http_settings {
     name                                = "backend-http-settings"
     cookie_based_affinity               = "Disabled"
-    path                                = "/"
     port                                = 80
     protocol                            = "Http"
     request_timeout                     = 60
     pick_host_name_from_backend_address = true
     probe_name                          = "backend-probe"
-    trusted_root_certificate_names      = []
   }
 
-  # HTTP listeners
+  # Single HTTP listener
   http_listener {
     name                           = "http-listener"
     frontend_ip_configuration_name = "agw-frontend-ip"
@@ -124,61 +103,58 @@ resource "azurerm_application_gateway" "main" {
     protocol                       = "Http"
   }
 
-  http_listener {
-    name                           = "https-listener"
-    frontend_ip_configuration_name = "agw-frontend-ip"
-    frontend_port_name             = "https-port"
-    protocol                       = "Https"
-    ssl_certificate_name           = "agw-ssl-cert"
+  # URL rewrite for API paths
+  rewrite_rule_set {
+    name = "api-rewrite"
+    
+    rewrite_rule {
+      name          = "add-api-prefix"
+      rule_sequence = 100
+      
+      condition {
+        variable    = "var_uri_path"
+        pattern     = "^/api/(.*)$"
+        ignore_case = true
+      }
+      
+      url {
+        path         = "/api/{var_uri_path_1}"
+        reroute      = false
+      }
+    }
   }
 
-  # HTTP to HTTPS redirect
-  redirect_configuration {
-    name                 = "http-to-https-redirect"
-    redirect_type        = "Permanent"
-    target_listener_name = "https-listener"
-    include_path         = true
-    include_query_string = true
-  }
-
-  # URL path map for HTTPS traffic
+  # Path map on HTTP
   url_path_map {
-    name                               = "https-path-map"
+    name                               = "http-path-map"
     default_backend_address_pool_name  = "frontend-pool"
     default_backend_http_settings_name = "frontend-http-settings"
 
     path_rule {
       name                       = "api-rule"
-      paths                      = ["/api/*"]
+      paths                      = ["/api/*", "/actuator/*"]
       backend_address_pool_name  = "backend-pool"
       backend_http_settings_name = "backend-http-settings"
+      rewrite_rule_set_name      = "api-rewrite"
     }
   }
 
-  # Request routing rules
+  # Routing rule on HTTP
   request_routing_rule {
-    name                        = "http-redirect-rule"
-    rule_type                   = "Basic"
-    http_listener_name          = "http-listener"
-    redirect_configuration_name = "http-to-https-redirect"
-    priority                    = 100
+    name               = "http-routing-rule"
+    rule_type          = "PathBasedRouting"
+    http_listener_name = "http-listener"
+    url_path_map_name  = "http-path-map"
+    priority           = 100
   }
 
-  request_routing_rule {
-    name                  = "https-routing-rule"
-    rule_type             = "PathBasedRouting"
-    http_listener_name    = "https-listener"
-    url_path_map_name     = "https-path-map"
-    priority              = 200
-  }
-
-  # SSL policy
+  # SSL policy (even for HTTP-only, Azure requires this)
   ssl_policy {
     policy_type = "Predefined"
-    policy_name = "AppGwSslPolicy20220101S"
+    policy_name = "AppGwSslPolicy20220101"
   }
 
-  # WAF configuration
+  # WAF configuration (Detection mode)
   waf_configuration {
     enabled          = true
     firewall_mode    = "Detection"

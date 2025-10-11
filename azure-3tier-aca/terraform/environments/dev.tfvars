@@ -19,6 +19,8 @@ vnet_address_space = ["10.0.0.0/16"]
 agw_subnet_cidr    = "10.0.1.0/24"
 aca_subnet_cidr    = "10.0.2.0/23"
 pe_subnet_cidr     = "10.0.4.0/24"
+aca_ca_subnet_cidr = "10.0.6.0/23"
+
 
 # Docker Hub
 dockerhub_org  = "youkim7"
@@ -30,7 +32,7 @@ api_image_tag = "dev-001"
 
 # Tags
 tags = {
-  Environment = "Development"
+  Environment = "Yousef"
   Project     = "BurgerBuilder"
-  Owner       = "DevOps Team"
+  Owner       = "Yousef"
 }

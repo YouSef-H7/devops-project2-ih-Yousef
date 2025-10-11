@@ -14,7 +14,7 @@ variable "resource_group_name" {
 }
 
 variable "subnet_id" {
-  description = "ID of the subnet for Container Apps"
+  description = "ID of the subnet for Container Apps (delegated to Microsoft.App/environments)"
   type        = string
 }
 
